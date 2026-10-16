@@ -1,0 +1,13 @@
+services:
+  focusmail:
+    build: .
+    ports:
+      - "127.0.0.1:${PORT:-8080}:8080"
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+    volumes:
+      - focusmail-data:/app/data
+    restart: unless-stopped
+volumes:
+  focusmail-data:
