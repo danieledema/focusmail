@@ -13,6 +13,11 @@ class Account(Base):
     smtp_port = Column(Integer, default=587)
     last_sync = Column(Float, default=0)
     sync_error = Column(String, default='')
+    auth_type = Column(String, default='password', server_default='password', nullable=False)
+    provider = Column(String, default='manual', server_default='manual', nullable=False)
+    oauth_subject = Column(String, nullable=True)
+    oauth_client_id = Column(String, nullable=True)
+    oauth_credentials = Column(Text, nullable=True)
 
 class Thread(Base):
     __tablename__ = 'threads'
@@ -40,6 +45,7 @@ class Message(Base):
     recipient = Column(String)
     date = Column(Float)
     body = Column(Text)
+    body_version = Column(Integer, default=1, server_default='1', nullable=False)
 
 class Setting(Base):
     __tablename__ = 'settings'

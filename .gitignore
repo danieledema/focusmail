@@ -9,3 +9,8 @@ data/
 *.db-shm
 *.db-wal
 .pnpm-store/
+.tools/
+frontend/src-tauri/target/
+frontend/src-tauri/binaries/focusmail-backend-*
+build/
+*.spec

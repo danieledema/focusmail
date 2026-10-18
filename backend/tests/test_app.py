@@ -1,13 +1,11 @@
 import os
 import tempfile
-os.environ['DATA_DIR'] = tempfile.mkdtemp(prefix='focusmail-test-')
-os.environ['DEMO_MODE'] = 'true'
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email import message_from_string
 from fastapi.testclient import TestClient
 from sqlalchemy import select
-from backend.main import app, synchronize
+from backend.main import app, run_maintenance
 from backend.database import Session, engine, Base
 from backend.models import Thread, PendingDelete, Account, Message
 from backend.auth import fernet, valid_cookie, signature
@@ -15,13 +13,6 @@ from backend.services.snooze_scheduler import snooze_time
 from backend.services.thread_builder import ingest, text_body
 import time
 import pytest
-
-@pytest.fixture
-def client():
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    with TestClient(app) as client:
-        yield client
 
 def current(client):
     return client.get('/api/state?session_id=test').json()
@@ -57,7 +48,7 @@ def test_deferred_delete_survives_new_session_and_finalizes(client):
         thread_id=pending.thread_id
         pending.due=time.time()-1
         db.commit()
-    synchronize()
+    run_maintenance()
     assert client.post('/api/undo/'+token).status_code==409
     with Session() as db:
         assert db.get(Thread,thread_id).status=='deleted'
@@ -96,7 +87,7 @@ def test_goal_inbox_zero_and_session_badges(client):
 
 def test_preferences_validation_and_secret_redaction(client):
     assert client.put('/api/preferences',json={'daily_goal':0}).status_code==422
-    assert client.put('/api/preferences',json={'daily_goal':4,'poll_interval':2,'ai_model':'gpt-4o-mini'}).status_code==200
+    assert client.put('/api/preferences',json={'daily_goal':4,'ai_model':'gpt-4o-mini'}).status_code==200
     state=current(client)
     assert state['preferences']['daily_goal']==4
     assert 'password' not in state['accounts'][0]
@@ -248,3 +239,264 @@ def test_streak_and_all_achievement_thresholds(client):
         state=game_state(db,'test',unlock=True)
         assert state['streak']==7
         assert all(next(b for b in state['badges'] if b['key']==key)['unlocked'] for key in ['first_reply','decisive','streak_3','streak_7','speed','century'])
+
+def test_startup_maintenance_and_cached_reads_never_fetch_mail(client, monkeypatch):
+    import backend.main as main
+    calls=[]
+    monkeypatch.setattr(main,'DEMO',False)
+    monkeypatch.setattr(main.imap_service,'sync_account',lambda db, account, *args:calls.append(account.id))
+    # The exact maintenance function used at startup and every scheduler tick.
+    main.run_maintenance()
+    client.get('/api/state')
+    client.get('/api/threads?status=archived')
+    assert calls==[]
+    assert 'poll_interval' not in current(client)['preferences']
+    assert client.post('/api/sync').status_code==200
+    deadline=time.monotonic()+2
+    while client.get('/api/sync').json()['running'] and time.monotonic()<deadline: time.sleep(.01)
+    assert len(calls)==1
+
+
+def test_archive_uses_receiving_account_and_its_own_folder(client, monkeypatch):
+    from backend.services import imap_service
+    connected=[]
+    fake=FakeIMAP()
+    def connect(account):
+        connected.append(account.username)
+        return fake
+    monkeypatch.setattr(imap_service,'connect',connect)
+    with Session() as db:
+        other=Account(name='Work',username='alex@work.example',password=fernet.encrypt(b'work-password').decode(),imap_host='imap.work.example',smtp_host='smtp.work.example')
+        db.add(other);db.flush()
+        thread=Thread(account_id=other.id,subject='A work conversation',oldest=time.time(),status='inbox')
+        db.add(thread);db.flush()
+        db.add(Message(thread_id=thread.id,account_id=other.id,uid='88',uidvalidity='1',body='Work email'))
+        db.commit()
+        imap_service.move_thread(db,thread,'archive')
+        assert connected==['alex@work.example']
+        assert ('MOVE','88','"Archive"') in fake.calls
+
+
+def test_api_key_is_encrypted_redacted_and_persistent(client, monkeypatch):
+    import backend.main as main
+    from backend.models import Setting
+    from backend.secrets import API_KEY_SETTING, ai_api_key
+    monkeypatch.setattr(main, 'DEMO', False)
+    secret = 'sk-test-only-not-a-real-key'
+    response = client.put('/api/ai/key', json={'key':secret})
+    assert response.status_code == 200 and response.json()['saved']
+    assert secret not in response.text
+    with Session() as db:
+        saved = db.get(Setting, API_KEY_SETTING)
+        assert saved.value != secret and fernet.decrypt(saved.value.encode()).decode() == secret
+    # A fresh database session, as on restart, reads the saved credential.
+    with Session() as db: assert ai_api_key(db) == secret
+    state = current(client)
+    assert state['ai_key_saved'] and secret not in str(state)
+    assert client.put('/api/ai/key', json={'key':''}).status_code == 200
+    assert not current(client)['ai_key_saved']
+
+
+def test_desktop_requires_single_use_launch_token(monkeypatch):
+    import backend.auth as auth
+    from fastapi import FastAPI
+    monkeypatch.setattr(auth, 'DESKTOP', True)
+    monkeypatch.setattr(auth, 'DEMO', True)  # Even demo desktop stays private to its window.
+    monkeypatch.setattr(auth, 'DESKTOP_TOKEN', 'desktop-token-for-test-only')
+    monkeypatch.setattr(auth, 'PASSWORD', 'desktop-session-secret')
+    desktop = FastAPI()
+    desktop.add_middleware(auth.AuthMiddleware)
+    @desktop.get('/api/state')
+    def private(): return {'ok':True}
+    with TestClient(desktop) as client:
+        assert client.get('/api/state').status_code == 401
+        assert client.get('/desktop/start/wrong-token').status_code == 401
+        response = client.get('/desktop/start/desktop-token-for-test-only', follow_redirects=False)
+        assert response.status_code == 303 and response.headers['location'] == '/'
+        assert 'HttpOnly' in response.headers['set-cookie']
+        assert client.get('/api/state').json() == {'ok':True}
+        assert "connect-src 'self'" in client.get('/api/state').headers['content-security-policy']
+        assert client.get('/desktop/start/desktop-token-for-test-only').status_code == 401
+        client.cookies.clear()
+        assert client.get('/api/state').status_code == 401
+
+
+def test_desktop_rejects_browser_origin_mutations(monkeypatch):
+    import backend.auth as auth
+    from fastapi import FastAPI
+    monkeypatch.setattr(auth, 'DESKTOP', True)
+    monkeypatch.setattr(auth, 'DESKTOP_TOKEN', 'test-launch-token')
+    desktop = FastAPI()
+    desktop.add_middleware(auth.AuthMiddleware)
+    with TestClient(desktop) as client:
+        client.get('/desktop/start/test-launch-token', follow_redirects=False)
+        response = client.put('/api/ai/key', headers={'Origin':'https://other-site.example'}, json={'key':'never-saved'})
+        assert response.status_code == 403
+
+
+def test_google_app_password_failure_is_actionable_and_redacted(client, monkeypatch):
+    import backend.main as main
+    import imaplib
+    monkeypatch.setattr(main, 'DEMO', False)
+    def fail(account):
+        raise imaplib.IMAP4.error(b'[ALERT] Application-specific password required: do-not-echo-provider-data')
+    monkeypatch.setattr(main.imap_service, 'connect', fail)
+    response=client.post('/api/accounts/1/test')
+    assert response.status_code==502
+    detail=response.json()['detail']
+    assert detail['checks'][0]['code']=='app_password_required'
+    assert detail['checks'][1]['status']=='skipped'
+    assert 'Google' in detail['message'] and 'app password' in detail['message']
+    assert 'do-not-echo-provider-data' not in response.text
+    assert 'app password' in current(client)['accounts'][0]['sync_error']
+
+
+def test_password_update_preserves_account_and_encrypts_secret(client, monkeypatch):
+    import backend.main as main
+    monkeypatch.setattr(main, 'DEMO', False)
+    before=current(client)
+    response=client.put('/api/accounts/1/password',json={'password':'replacement-app-password'})
+    assert response.status_code==200 and 'password' not in response.json()
+    with Session() as db:
+        row=db.get(Account,1)
+        assert row.password!='replacement-app-password'
+        assert fernet.decrypt(row.password.encode())==b'replacement-app-password'
+    assert current(client)['counts']==before['counts']
+    assert client.put('/api/accounts/1/password',json={'password':''}).status_code==422
+
+
+def test_connection_test_distinguishes_smtp_failure(client, monkeypatch):
+    import backend.main as main
+    import smtplib
+    monkeypatch.setattr(main, 'DEMO', False)
+    class Connected:
+        def noop(self): pass
+        def logout(self): pass
+    monkeypatch.setattr(main.imap_service,'connect',lambda _:Connected())
+    def fail(_): raise smtplib.SMTPAuthenticationError(535,b'login failed: never-echo-this')
+    monkeypatch.setattr(main.smtp_service,'test_smtp',fail)
+    response=client.post('/api/accounts/1/test')
+    checks=response.json()['detail']['checks']
+    assert checks[0]['service']=='IMAP' and checks[0]['status']=='ok'
+    assert checks[1]['service']=='SMTP' and checks[1]['code']=='authentication_failed'
+    assert 'never-echo-this' not in response.text
+
+
+def test_diagnostics_classify_dns_tls_timeout():
+    import socket
+    import ssl
+    from backend.services.connection_diagnostics import connection_error
+    assert connection_error(socket.gaierror('untrusted-hostname'))['code']=='hostname_not_found'
+    assert connection_error(TimeoutError())['code']=='connection_timeout'
+    assert connection_error(ssl.SSLCertVerificationError())['code']=='certificate_verification_failed'
+
+
+@pytest.mark.parametrize('auth_type',['password','oauth2'])
+@pytest.mark.parametrize('extension',['MOVE','UIDPLUS'])
+def test_move_refreshes_capabilities_after_authentication(client, monkeypatch, auth_type, extension):
+    from backend.services import imap_service
+    class AuthenticatedIMAP(FakeIMAP):
+        capabilities = (b'IMAP4rev1', b'AUTH=XOAUTH2')
+        authenticated = False
+        def login(self, *args): self.authenticated = True
+        def authenticate(self, *args): self.authenticated = True
+        def capability(self):
+            assert self.authenticated
+            return 'OK', [b'imap4rev1 ' + extension.lower().encode()]
+    fake=AuthenticatedIMAP()
+    monkeypatch.setattr(imap_service.imaplib,'IMAP4_SSL',lambda *args,**kwargs:fake)
+    monkeypatch.setattr(imap_service,'access_token',lambda account:'fictional-token')
+    with Session() as db:
+        thread=db.scalar(select(Thread))
+        account=db.get(Account,thread.account_id); account.auth_type=auth_type
+        db.add(Message(thread_id=thread.id,account_id=account.id,uid='77',uidvalidity='1',folder='INBOX',body='test'))
+        db.commit()
+        imap_service.move_thread(db,thread,'delete')
+    if extension == 'MOVE':
+        assert ('MOVE','77','"Deleted Items"') in fake.calls
+    else:
+        assert ('COPY','77','"Deleted Items"') in fake.calls
+        assert ('EXPUNGE','77') in fake.calls
+    assert all(call != ('EXPUNGE',) for call in fake.calls)
+
+
+def test_capability_failure_closes_connection_without_changing_mail(client,monkeypatch):
+    from backend.services import imap_service
+    from unittest.mock import Mock
+    fake=Mock()
+    fake.capability.return_value=('NO',[b'not available'])
+    monkeypatch.setattr(imap_service.imaplib,'IMAP4_SSL',lambda *args,**kwargs:fake)
+    with Session() as db:
+        with pytest.raises(RuntimeError,match='authenticated IMAP capabilities'):
+            imap_service.connect(db.scalar(select(Account)))
+    fake.logout.assert_called_once()
+    fake.uid.assert_not_called()
+
+
+def test_reply_and_archive_sends_once_and_uses_receiving_account(client,monkeypatch):
+    import backend.main as main
+    monkeypatch.setattr(main,'DEMO',False)
+    sent=[];moves=[]
+    monkeypatch.setattr(main.smtp_service,'send_reply',lambda account,*args:sent.append(account.id) or '<reply-test@example.com>')
+    monkeypatch.setattr(main.imap_service,'move_thread',lambda db,thread,action:moves.append((thread.account_id,action)))
+    before=current(client);tid=before['thread']['id'];aid=before['thread']['account']['id']
+    response=action(client,'reply',body='A test reply',archive_after_reply=True)
+    assert response.status_code==200 and response.json()['reply_archived']
+    assert sent==[aid] and moves==[(aid,'archive')]
+    assert current(client)['counts']['inbox']==before['counts']['inbox']-1
+    with Session() as db:
+        assert db.get(Thread,tid).status=='replied'
+        copy=db.scalar(select(Message).where(Message.message_id=='<reply-test@example.com>'))
+        assert copy.folder=='Sent'
+    assert client.post(f'/api/threads/{tid}/action',json={'action':'reply','body':'Duplicate','session_id':'test'}).status_code==409
+    assert len(sent)==1
+
+
+def test_reply_only_keeps_inbox_and_never_archives(client,monkeypatch):
+    import backend.main as main
+    monkeypatch.setattr(main,'DEMO',False)
+    monkeypatch.setattr(main.smtp_service,'send_reply',lambda *args:'<reply-only@example.com>')
+    def unexpected(*args): raise AssertionError('Send only must never archive')
+    monkeypatch.setattr(main.imap_service,'move_thread',unexpected)
+    before=current(client);tid=before['thread']['id']
+    response=action(client,'reply',body='Keep this conversation',archive_after_reply=False)
+    assert response.status_code==200 and not response.json()['reply_archived']
+    assert current(client)['counts']['inbox']==before['counts']['inbox']
+    with Session() as db: assert db.get(Thread,tid).status=='inbox'
+
+
+def test_smtp_reply_unfolds_threading_headers():
+    from backend.services import smtp_service
+    from unittest.mock import Mock,patch
+    account=Account(username='me@example.com',smtp_host='smtp.example.com',smtp_port=465)
+    latest=Message(sender='you@example.com',message_id='\r\n <original@example.com>',references='<first@example.com>\r\n <second@example.com>')
+    smtp=Mock()
+    with patch.object(smtp_service.smtplib,'SMTP_SSL',return_value=smtp),patch.object(smtp_service,'authenticate'):
+        smtp_service.send_reply(account,latest,'Test','Hello')
+    message=smtp.send_message.call_args.args[0]
+    assert message['In-Reply-To']=='<original@example.com>'
+    assert message['References']=='<first@example.com> <second@example.com> <original@example.com>'
+
+
+def test_gmail_archive_uses_localized_all_mail_and_ignores_local_sent_copy(client,monkeypatch):
+    from backend.services import imap_service
+    class Gmail(FakeIMAP):
+        capabilities=(b'X-GM-EXT-1',b'MOVE',b'UIDPLUS')
+        def list(self,*args): return 'OK',[b'(\\All \\HasNoChildren) "/" "[Gmail]/Tutti i messaggi"']
+    fake=Gmail()
+    monkeypatch.setattr(imap_service,'connect',lambda account:fake)
+    with Session() as db:
+        thread=db.scalar(select(Thread))
+        db.add(Message(thread_id=thread.id,account_id=thread.account_id,uid='77',uidvalidity='1',folder='INBOX',body='Original'))
+        db.add(Message(thread_id=thread.id,account_id=thread.account_id,uid='sent-local',uidvalidity='local',folder='Sent',body='Reply'))
+        db.commit();imap_service.move_thread(db,thread,'archive')
+    assert ('MOVE','77','"[Gmail]/Tutti i messaggi"') in fake.calls
+    assert not any(call[0] in ('COPY','EXPUNGE') for call in fake.calls)
+
+
+def test_nonexistent_folder_none_response_is_not_an_archive_destination():
+    from backend.services.imap_service import destination
+    class MissingFolders:
+        def list(self,*args): return 'OK',[None]
+    with pytest.raises(RuntimeError,match='No provider folder found'):
+        destination(MissingFolders(),'archive')

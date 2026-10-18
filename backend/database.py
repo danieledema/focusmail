@@ -22,3 +22,15 @@ def initialize_database():
         columns = {row[1] for row in conn.exec_driver_sql('PRAGMA table_info(messages)')}
         if 'folder' not in columns:
             conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN folder VARCHAR DEFAULT 'INBOX'")
+
+        if 'body_version' not in columns:
+            conn.exec_driver_sql("ALTER TABLE messages ADD COLUMN body_version INTEGER NOT NULL DEFAULT 0")
+
+        account_columns = {row[1] for row in conn.exec_driver_sql('PRAGMA table_info(accounts)')}
+        for name, definition in {
+            'auth_type': "VARCHAR NOT NULL DEFAULT 'password'",
+            'provider': "VARCHAR NOT NULL DEFAULT 'manual'",
+            'oauth_subject': 'VARCHAR', 'oauth_client_id': 'VARCHAR', 'oauth_credentials': 'TEXT'
+        }.items():
+            if name not in account_columns:
+                conn.exec_driver_sql(f'ALTER TABLE accounts ADD COLUMN {name} {definition}')
